@@ -1,0 +1,13 @@
+[package]
+name = "ad-auction-agent"
+version = "0.1.0"
+authors = []
+
+[mpc]
+backend = "honeybadger"
+parties = 5
+threshold = 1
+
+[build]
+source = "src/auction.stfl"
+target_dir = "target"

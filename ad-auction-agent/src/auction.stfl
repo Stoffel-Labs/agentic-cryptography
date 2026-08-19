@@ -1,0 +1,153 @@
+# Ad-Space Auction for AI Agents -- sealed-bid MPC core.
+#
+# Privacy model (the whole point of this app):
+#   * Each bidding agent is a separate MPC client slot. It seals its bid with
+#     ClientStore.take_share(i, 0) -- the plaintext bid never leaves the
+#     bidder's own client process and the auctioneer/coordinator never sees it.
+#   * All bids stay secret-shared for the entire auction. The winner is found by
+#     a secret-shared argmax (secure comparison + oblivious select); no bid is
+#     ever opened mid-auction, so no bidder can learn another bidder's value.
+#   * Only at the very end are two things opened:
+#       - each bidder learns a SINGLE bit: did *I* win? (nothing about the
+#         price, the other bids, or who else bid);
+#       - the auctioneer (host) learns the winner index and the winning price,
+#         but NOT any of the losing bids.
+#
+# First-price rule: the highest sealed bid wins and pays its own bid.
+# (Second-price / Vickrey is a documented one-function variant -- see README.)
+#
+# run-args: --client-input 0=300 --client-input 1=500 --client-input 2=900 --client-input 3=700 --expected-output-clients 4
+
+# Cryptographic random bit in {0,1} via a masked square (Berkovich constant-round
+# method). Used to build secret-shared randomness for the comparison openings.
+def random_bit() -> Share:
+  while True:
+    var r = Share.random_field()
+    var r_squared = Share.open_field(Share.mul(r, r))
+    if Field.is_zero(r_squared):
+      continue
+    var r_prime_inv = Field.inverse(Field.sqrt(r_squared))
+    var two_inv = Field.inverse(Field.from_int(2))
+    var c = Share.mul_field(r, r_prime_inv)
+    var a = Share.mul_field(Share.add_field(c, Field.one()), two_inv)
+    return Share.retag(a, 1)
+
+def pow2(i: int64) -> int64:
+  var p = 1
+  var k = 0
+  while k < i:
+    p = p * 2
+    k = k + 1
+  return p
+
+def combine_bits(bits: list[Share], n: int64) -> Share:
+  var acc = Share.mul_scalar(bits[0], 1)
+  var i = 1
+  while i < n:
+    acc = Share.add(acc, Share.mul_scalar(bits[i], pow2(i)))
+    i = i + 1
+  return Share.retag(acc, 64)
+
+# Secret-shared [a < b] for a, b in [0, 2^l): masked reveal + carry chain.
+# One field opening per call; the random mask keeps the opened value uninformative.
+def less_than(a: Share, b: Share, l: int64, kappa: int64) -> Share:
+  var z = Share.add_constant(Share.sub(Share.retag(a, 64), Share.retag(b, 64)), pow2(l))
+  var rbits: list[Share] = []
+  var i = 0
+  while i < (l + 1):
+    rbits.append(random_bit())
+    i = i + 1
+  var r_low = combine_bits(rbits, l + 1)
+  var r_high = Share.retag(Share.random_int(kappa), 64)
+  var r = Share.add(r_low, Share.mul_scalar(r_high, pow2(l + 1)))
+  var c = Share.open(Share.retag(Share.add(Share.retag(z, 64), r), 64))
+  var borrow = Share.from_clear_int(0, 1)
+  i = 0
+  while i < l:
+    var ci = (c shr i) and 1
+    var ri = rbits[i]
+    var rb = Share.mul(ri, borrow)
+    if ci == 0:
+      borrow = Share.retag(Share.sub(Share.add(ri, borrow), rb), 1)
+    else:
+      borrow = Share.retag(rb, 1)
+    i = i + 1
+  var cl = (c shr l) and 1
+  var rl = rbits[l]
+  var rlb = Share.mul(rl, borrow)
+  var zl = Share.sub(Share.add(rl, borrow), Share.mul_scalar(rlb, 2))
+  if cl == 1:
+    zl = Share.sub(Share.from_clear_int(1, 1), zl)
+  return Share.sub(Share.from_clear_int(1, 1), Share.retag(zl, 1))
+
+# Oblivious select: returns a if cond==1 else b.  b + cond*(a-b), one multiply.
+def select(cond: Share, a: Share, b: Share) -> Share:
+  var aa = Share.retag(a, 64)
+  var bb = Share.retag(b, 64)
+  var c = Share.retag(cond, 64)
+  return Share.add(bb, Share.mul(c, Share.sub(aa, bb)))
+
+# [a == b] = NOT(a<b) AND NOT(b<a)
+def equal(a: Share, b: Share, l: int64, kappa: int64) -> Share:
+  var nlt = Share.sub(Share.from_clear_int(1, 1), less_than(a, b, l, kappa))
+  var ngt = Share.sub(Share.from_clear_int(1, 1), less_than(b, a, l, kappa))
+  return Share.mul(nlt, ngt)
+
+# Sealed-bid first-price auction over n client-submitted secret bids.
+# Returns [winner_idx (secret), winning_bid (secret)] -- both stay shared here;
+# the caller decides what to open. Ties go to the earliest (lowest-index) bidder.
+def sealed_bid_auction(bids: list[Share], n: int64, l: int64, kappa: int64) -> list[Share]:
+  var best_v = bids[0]
+  var best_i = Share.from_clear_int(0, 64)
+  var i = 1
+  while i < n:
+    var gt = less_than(best_v, bids[i], l, kappa)   # bids[i] > best
+    best_v = select(gt, bids[i], best_v)
+    best_i = select(gt, Share.from_clear_int(i, 64), best_i)
+    i = i + 1
+  var out: list[Share] = []
+  out.append(best_i)
+  out.append(best_v)
+  return out
+
+def main() -> list[int64]:
+  var l = 20          # bid bit-width: bids in [0, 2^20)  (~1,048,575 units)
+  var kappa = 8       # masking security for local dev; production uses ~40
+  var n = 4           # number of bidding AI agents (== client slots)
+
+  # --- each agent seals its bid; plaintext never leaves the bidder's client ---
+  var bids: list[Share] = []
+  var i = 0
+  while i < n:
+    var b: secret int64 = ClientStore.take_share(i, 0)
+    bids.append(b)
+    i = i + 1
+
+  # --- MPC computes the winner without opening a single bid ---
+  var res = sealed_bid_auction(bids, n, l, kappa)   # [winner_idx, winning_bid]
+  var winner_idx = res[0]
+  var winning_bid = res[1]
+
+  # --- authorized end-of-auction reveals (and nothing else) ---
+  # Each bidder learns ONLY whether it won: a 1 bit, no price, no other bids.
+  if Mpc.has_capability("client-output"):
+    i = 0
+    while i < n:
+      var won_i = Share.retag(
+        Share.sub(Share.from_clear_int(1, 1),
+                  equal(winner_idx, Share.from_clear_int(i, 64), l, kappa)), 1)
+      won_i.send_to_client(i)
+      i = i + 1
+
+  # The auctioneer (host) learns who won and what to charge, but not the
+  # losing bids.
+  var widx = Share.open(Share.retag(winner_idx, 64))
+  var price = Share.open(Share.retag(winning_bid, 64))
+
+  # Local-semantics assertions for the trusted dev harness (bids 300,500,900,700).
+  assert widx == 2, "winner index must be 2"
+  assert price == 900, "winning bid must be 900"
+  var result: list[int64] = []
+  result.append(widx)
+  result.append(price)
+  return result
